@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 # Load environment variables from the .env file
 load_dotenv()
 
-# Get the base directory of the project for reliable path resolution on Vercel
+# Get the base directory of the project for reliable path resolution
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Add project root to path
@@ -95,7 +95,7 @@ app = FastAPI(title="HealthMate AI")
 # CORS Middleware configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, replace with your Vercel frontend URL
+    allow_origins=["*"], # In production, replace with your specific frontend domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -104,6 +104,10 @@ app.add_middleware(
 # Define paths relative to the project root
 static_path = os.path.join(BASE_DIR, "static")
 templates_path = os.path.join(BASE_DIR, "templates")
+upload_path = os.path.join(BASE_DIR, "uploads")
+
+# Ensure required local directories exist
+os.makedirs(upload_path, exist_ok=True)
 
 # Mount static files if the directory exists
 if os.path.exists(static_path):
@@ -120,15 +124,15 @@ def get_template_context(request: Request, user_name: str = "Anonymous", uid: in
 
 @app.post("/api/analyze-prescription")
 async def analyze_prescription_endpoint(file: UploadFile = File(...)):
-    """Processes uploaded images. Uses /tmp/ for Vercel read-only filesystem compatibility."""
+    """Processes uploaded images. Uses the local uploads/ directory for Render compatibility."""
     if not ANALYZER_AVAILABLE:
         return JSONResponse(
             {"message": "AI module unavailable.", "medications": [], "interactions": [], "accuracy_score": 0.0},
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE
         )
     
-    # Use /tmp/ because the rest of the Vercel filesystem is read-only
-    temp_file_path = f"/tmp/{file.filename}"
+    # Save file to the uploads directory
+    temp_file_path = os.path.join(upload_path, file.filename)
     try:
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
@@ -217,6 +221,7 @@ async def read_dashboard(request: Request, uid: int | None = None, db: Session =
 # --- Server Startup ---
 
 if __name__ == "__main__":
-    # Vercel handles this via api/index.py, but this allows for local testing
+    # Render and local testing logic
     server_port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=server_port, reload=True)
+    # Note: reload=True removed for production stability
+    uvicorn.run("main:app", host="0.0.0.0", port=server_port)
