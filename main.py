@@ -5,8 +5,11 @@ from dotenv import load_dotenv
 # Load environment variables from the .env file
 load_dotenv()
 
-# Add current directory to path to ensure local modules are found
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Get the base directory of the project for reliable path resolution on Vercel
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Add project root to path
+sys.path.append(BASE_DIR)
 
 from fastapi import FastAPI, Request, Form, Depends, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
@@ -32,19 +35,17 @@ except (ImportError, Exception) as e:
     ANALYZER_AVAILABLE = False
 
 # --- Database Configuration (PostgreSQL / Supabase) ---
-# Fetches the URL from your .env file.
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Handle potential 'postgres://' vs 'postgresql://' issues common with some cloud providers
+# Handle 'postgres://' vs 'postgresql://' issues common with cloud providers
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 if not DATABASE_URL:
-    print("WARNING: DATABASE_URL not found in .env. Falling back to local SQLite.")
+    print("WARNING: DATABASE_URL not found. Falling back to local SQLite.")
     DATABASE_URL = "sqlite:///./healthmate.db"
 
-# Create the SQLAlchemy engine
-# psycopg2 is used as the driver for PostgreSQL
+# Create the SQLAlchemy engine (psycopg2-binary required for PostgreSQL)
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -60,7 +61,7 @@ class User(Base):
     password = Column(String, nullable=False)
     role = Column(String, default="user")
 
-# Create tables in Supabase (if they don't exist)
+# Create tables in Supabase if they don't exist
 Base.metadata.create_all(bind=engine)
 
 # --- Security & Hashing ---
@@ -92,22 +93,23 @@ def get_next_uid(db: Session) -> int:
 app = FastAPI(title="HealthMate AI")
 
 # CORS Middleware configuration
-# In production, replace ["*"] with your specific Vercel URL
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # In production, replace with your Vercel frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize required local directories
-for folder in ["static", "uploads", "templates"]:
-    if not os.path.exists(folder):
-        os.makedirs(folder)
+# Define paths relative to the project root
+static_path = os.path.join(BASE_DIR, "static")
+templates_path = os.path.join(BASE_DIR, "templates")
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+# Mount static files if the directory exists
+if os.path.exists(static_path):
+    app.mount("/static", StaticFiles(directory=static_path), name="static")
+
+templates = Jinja2Templates(directory=templates_path)
 
 def get_template_context(request: Request, user_name: str = "Anonymous", uid: int | None = None):
     """Generates the default context for Jinja2 templates."""
@@ -118,28 +120,29 @@ def get_template_context(request: Request, user_name: str = "Anonymous", uid: in
 
 @app.post("/api/analyze-prescription")
 async def analyze_prescription_endpoint(file: UploadFile = File(...)):
-    """Processes uploaded prescription images via the AI module."""
+    """Processes uploaded images. Uses /tmp/ for Vercel read-only filesystem compatibility."""
     if not ANALYZER_AVAILABLE:
         return JSONResponse(
-            {"message": "AI module unavailable on this server.", "medications": [], "interactions": [], "accuracy_score": 0.0},
+            {"message": "AI module unavailable.", "medications": [], "interactions": [], "accuracy_score": 0.0},
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE
         )
     
-    file_location = f"uploads/{file.filename}"
+    # Use /tmp/ because the rest of the Vercel filesystem is read-only
+    temp_file_path = f"/tmp/{file.filename}"
     try:
-        with open(file_location, "wb") as buffer:
+        with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        # Run analysis
-        result = analyze_prescription_image(file_location)
+        # Run AI analysis logic
+        result = analyze_prescription_image(temp_file_path)
         return JSONResponse(result, status_code=status.HTTP_200_OK)
     except Exception as e:
         print(f"Error during image analysis: {e}")
         return JSONResponse({"message": "Error processing image."}, status_code=500)
     finally:
-        # Cleanup uploaded file
-        if os.path.exists(file_location):
-            os.remove(file_location)
+        # Cleanup temp file
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
 
 # --- Frontend View Routes ---
 
@@ -162,26 +165,26 @@ async def login_user(
     password: str = Form(...),
     role: str = Form(...)
 ):
-    """Authenticates users against the PostgreSQL database."""
+    """Authenticates users against PostgreSQL."""
     user = db.query(User).filter(User.email == email).first()
     
     if user and verify_password(password, user.password):
         if user.role == role:
             path = "/doctor_dashboard" if user.role == "doctor" else "/dashboard"
             return RedirectResponse(f"{path}?uid={user.uid}", status_code=status.HTTP_303_SEE_OTHER)
-        return RedirectResponse(f"/login?error=Incorrect role selected for this account.", status_code=303)
+        return RedirectResponse(f"/login?error=Incorrect role selected.", status_code=303)
     
     return RedirectResponse("/login?error=Invalid email or password.", status_code=303)
 
 @app.post("/signup")
 async def signup_user(request: Request, db: Session = Depends(get_db)):
-    """Registers new users into the PostgreSQL database."""
+    """Registers new users into PostgreSQL."""
     try:
         data = await request.json()
         if data.get('password') != data.get('confirm_password'):
             return JSONResponse({"message": "Passwords do not match."}, status_code=400)
         
-        # Check if user already exists
+        # Check uniqueness
         existing_user = db.query(User).filter(User.email == data.get('email')).first()
         if existing_user:
             return JSONResponse({"message": "Email already registered."}, status_code=409)
@@ -200,8 +203,7 @@ async def signup_user(request: Request, db: Session = Depends(get_db)):
         target = '/doctor_dashboard' if new_user.role == 'doctor' else '/dashboard'
         return JSONResponse({"message": "Success", "redirect_url": f"{target}?uid={new_user.uid}"}, status_code=201)
     except Exception as e:
-        print(f"Signup error: {e}")
-        return JSONResponse({"message": "Internal server error during registration."}, status_code=500)
+        return JSONResponse({"message": "Internal server error during signup."}, status_code=500)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def read_dashboard(request: Request, uid: int | None = None, db: Session = Depends(get_db)):
@@ -215,6 +217,6 @@ async def read_dashboard(request: Request, uid: int | None = None, db: Session =
 # --- Server Startup ---
 
 if __name__ == "__main__":
-    # Cloud Run injects the PORT environment variable
+    # Vercel handles this via api/index.py, but this allows for local testing
     server_port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=server_port, reload=True)
